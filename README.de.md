@@ -143,3 +143,7 @@ llm-tps --server http://127.0.0.1:9000
 - Ob das Modell gerade „denkt“ oder antwortet, ist über die API nicht erkennbar. Beides zählt als erzeugte Token.
 - Ausgelegt auf einen Slot pro Modell (`parallel = 1`), wie für einen einzelnen Agenten üblich.
 - Die GPU-Werte gibt es nur für NVIDIA.
+
+## Lizenz
+
+Copyright (C) 2026 Sven Janzon. Lizenziert unter der [GNU General Public License v3.0 oder später](LICENSE). Du darfst llm-tps nutzen, verändern und weitergeben. Veränderte Versionen, die du weitergibst, müssen ebenfalls unter der GPL stehen und ihren Quellcode mitliefern.

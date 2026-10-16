@@ -141,3 +141,7 @@ llm-tps --server http://127.0.0.1:9000
 - The API does not reveal whether the model is currently "thinking" or answering. Both count as generated tokens.
 - Built for one slot per model (`parallel = 1`), the usual setup for a single-user agent.
 - GPU meters are NVIDIA only.
+
+## License
+
+Copyright (C) 2026 Sven Janzon. Licensed under the [GNU General Public License v3.0 or later](LICENSE). You may use, change and share llm-tps; modified versions you distribute must stay under the GPL and include their source code.
