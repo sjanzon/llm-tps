@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""Live terminal dashboard for a local llama.cpp router (llama-server in router mode).
+
+  llm-tps                full-screen dashboard (keys: q quit · p pause · v view all/log/chart ·
+                         1/2/3/4 chart window 1/5/15/60 min · a auto · c reset statistics)
+  llm-tps --plain        plain text lines (narrow terminals, logging to a file)
+  llm-tps -n 20          print the last 20 answers and events from the log
+
+Options:  --server URL   llama.cpp router address   (env LLM_TPS_SERVER, default http://127.0.0.1:8080)
+          --unit NAME    systemd user unit to read  (env LLM_TPS_UNIT,   default llama-router)
+"""
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import urllib.error
+import urllib.request
+
+SERVER = os.environ.get("LLM_TPS_SERVER", "http://127.0.0.1:8080")
+UNIT = os.environ.get("LLM_TPS_UNIT", "llama-router")
+BLOCKS = " ▁▂▃▄▅▆▇█"
+RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+GREEN, BLUE, YELLOW, RED = "\033[32m", "\033[34m", "\033[33m", "\033[31m"
+MODEL_COLORS = ["\033[32m", "\033[36m", "\033[35m", "\033[92m", "\033[96m", "\033[95m"]
+VIEWS = ["all", "log", "chart"]
+WINDOWS = {"1": 60, "2": 300, "3": 900, "4": 3600, "a": None}     # chart time window in seconds
+CTX_BUCKETS = [(16_000, "<16k"), (64_000, "16–64k"), (float("inf"), ">64k")]
+
+LINE_RE = re.compile(r"^(\S+) \S+ [^:]+: (.*)$")          # journalctl -o short-iso
+INST_RE = re.compile(r"^\[(\d+)\] ")                       # line of a model instance: "[port] …"
+TOKENS_RE = re.compile(r"=\s*([\d.]+) ms /\s*(\d+) tokens.*?([\d.]+) tokens per second")
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+# ================================================================ log parsing
+
+class LogParser:
+    """Turns router log lines into events. An answer is completed on the 'release'
+    line, which comes after the prompt, generation and MTP figures."""
+
+    def __init__(self):
+        self.port_model, self.spawn_time, self.task = {}, {}, {}
+
+    def feed(self, raw):
+        m = LINE_RE.match(raw.rstrip("\n"))
+        if not m:
+            return None
+        try:
+            ts = datetime.datetime.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+        msg, t = m.group(2), m.group(1)[11:19]
+        inst = INST_RE.match(msg)
+
+        if inst is None:                                          # lines of the router itself
+            if (s := re.search(r"spawning server instance with name=(\S+) on port (\d+)", msg)):
+                self.port_model[s.group(2)] = s.group(1)
+                self.spawn_time[s.group(1)] = ts
+                return {"kind": "load", "t": t, "ts": ts, "model": s.group(1)}
+            if (s := re.search(r"evicting idle LRU name=(\S+)", msg)):
+                return {"kind": "evict", "t": t, "ts": ts, "model": s.group(1)}
+            if (s := re.search(r"instance name=(\S+) exited with status (\d+)", msg)):
+                return {"kind": "exit", "t": t, "ts": ts, "model": s.group(1), "status": int(s.group(2))}
+            if msg.startswith((f"Stopped {UNIT}", f"Started {UNIT}")):
+                return {"kind": "service", "t": t, "ts": ts, "text": msg.split(" - ")[0]}
+            return None
+
+        port = inst.group(1)
+        model = self.port_model.get(port, f"port {port}")
+        if "llama_server: model loaded" in msg:
+            start = self.spawn_time.get(model)
+            return {"kind": "ready", "t": t, "ts": ts, "model": model,
+                    "secs": (ts - start).total_seconds() if start else None}
+        cur = self.task.setdefault(port, {})
+        num = TOKENS_RE.search(msg)
+        if "prompt eval time" in msg and num:
+            cur.update(p_ms=float(num.group(1)), p_tok=int(num.group(2)), p_tps=float(num.group(3)))
+        elif "eval time" in msg and num:
+            cur.update(g_ms=float(num.group(1)), g_tok=int(num.group(2)), g_tps=float(num.group(3)))
+        elif "draft acceptance" in msg and (a := re.search(r"= ([\d.]+)", msg)):
+            cur["mtp"] = float(a.group(1))
+        elif "stop processing: n_tokens" in msg:
+            done, self.task[port] = cur, {}
+            if "g_tok" not in done:                               # cancelled / no output
+                return None
+            ctx = int(re.search(r"n_tokens = (\d+)", msg).group(1))
+            prompt_total = max(0, ctx - done["g_tok"])
+            p_tok = done.get("p_tok", 0)
+            return {"kind": "answer", "t": t, "ts": ts, "model": model, "ctx": ctx,
+                    "p_tok": p_tok, "p_tps": done.get("p_tps", 0.0), "ttft": done.get("p_ms", 0.0) / 1000,
+                    "cached": max(0, prompt_total - p_tok), "prompt_total": prompt_total,
+                    "g_tok": done["g_tok"], "g_tps": done["g_tps"], "g_sec": done["g_ms"] / 1000,
+                    "mtp": done.get("mtp")}
+        return None
+
+
+def events(lines):
+    parser = LogParser()
+    for raw in lines:
+        if (ev := parser.feed(raw)) is not None:
+            yield ev
+
+
+def describe(ev, color=lambda m: ""):
+    c = color(ev.get("model", ""))
+    name = f"{c}{ev.get('model', '')}{RESET if c else ''}"
+    k = ev["kind"]
+    if k == "answer":
+        cache = f"  cache {ev['cached'] / ev['prompt_total'] * 100:3.0f} %" if ev["prompt_total"] else ""
+        mtp = f"  MTP {ev['mtp'] * 100:3.0f} %" if ev.get("mtp") is not None else ""
+        return (f"{ev['t']}  ✔ {name}: {ev['g_tok']:5d} tok @ {ev['g_tps']:5.1f} t/s  "
+                f"TTFT {ev['ttft']:4.1f} s  context {ev['ctx'] / 1000:5.1f}k{cache}{mtp}")
+    if k == "load":
+        return f"{ev['t']}  ▶ loading {name} …"
+    if k == "ready":
+        secs = f" in {ev['secs']:.0f} s" if ev.get("secs") is not None else ""
+        return f"{ev['t']}  ● {name} loaded{secs}"
+    if k == "evict":
+        return f"{ev['t']}  ⇄ model switch: unloading {name}"
+    if k == "exit":
+        status = "" if ev["status"] == 0 else f" {RED}(exit code {ev['status']}){RESET}"
+        return f"{ev['t']}  ■ {name} unloaded{status}"
+    if k == "service":
+        return f"{ev['t']}  ⚙ {ev['text']}"
+    return ""
+
+
+def journal(follow):
+    """Today's log; with follow=True the stream continues live (one parser for everything,
+    so the port -> model mapping from earlier lines is kept)."""
+    args = ["journalctl", "--user", "-u", UNIT, "--no-pager", "-o", "short-iso", "--since", "today"]
+    args += ["-f"] if follow else []
+    return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+
+
+# ================================================================ data sources
+
+def get(path):
+    with urllib.request.urlopen(SERVER + path, timeout=2) as r:
+        return json.load(r)
+
+
+class System:
+    """GPU (nvidia-smi), RAM and CPU of the llama-server processes; runs in its own thread."""
+
+    def __init__(self):
+        self.gpu = None                       # dict or None
+        self.ram_used = self.ram_total = self.llama_rss = 0.0
+        self.llama_cores = 0.0
+        self._cpu_prev = {}
+        self._clk = os.sysconf("SC_CLK_TCK")
+        self.ncpu = os.cpu_count() or 1
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            self._read_gpu()
+            self._read_proc()
+            time.sleep(1.0)
+
+    def _read_gpu(self):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,"
+                                  "temperature.gpu,power.draw,power.limit", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=3).stdout.split(",")
+            util, used, total, temp, power, limit = (float(x) for x in out[:6])
+            self.gpu = {"util": util, "used": used / 1024, "total": total / 1024, "temp": temp,
+                        "power": power, "limit": limit}
+        except Exception:
+            self.gpu = None
+
+    def _read_proc(self):
+        try:
+            mem = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+            kb = lambda k: float(mem[k].split()[0])
+            self.ram_total = kb("MemTotal") / 1024 ** 2
+            self.ram_used = (kb("MemTotal") - kb("MemAvailable")) / 1024 ** 2
+        except Exception:
+            pass
+        now, rss, cores, seen = time.time(), 0.0, 0.0, {}
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    if f.read().strip() != "llama-server":
+                        continue
+                with open(f"/proc/{pid}/stat") as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+                ticks = int(fields[11]) + int(fields[12])        # utime + stime
+                with open(f"/proc/{pid}/status") as f:
+                    rss += next(int(l.split()[1]) for l in f if l.startswith("VmRSS")) / 1024 ** 2
+            except (OSError, StopIteration, IndexError, ValueError):
+                continue
+            seen[pid] = (now, ticks)
+            if pid in self._cpu_prev:
+                t0, k0 = self._cpu_prev[pid]
+                cores += (ticks - k0) / self._clk / max(now - t0, 1e-6)
+        self._cpu_prev, self.llama_rss, self.llama_cores = seen, rss, cores
+
+
+class Monitor:
+    """Polls the router and records one sample per second."""
+
+    def __init__(self):
+        self.models, self.status = [], {}
+        self.model, self.state = None, "offline"      # offline | idle | loading | prompt | gen
+        self.decoded = self.ctx = self.n_ctx = self.cache = 0
+        self.rate = 0.0
+        self.history = collections.deque(maxlen=3600)    # (state, tok/s, model) per second
+        self._task, self._samples, self._prev = None, [], None
+        self._col_tokens, self._col_start = 0, time.time()
+
+    def color(self, model):
+        return MODEL_COLORS[self.models.index(model) % len(MODEL_COLORS)] if model in self.models else ""
+
+    def poll(self):
+        now = time.time()
+        try:
+            data = get("/models")["data"]
+        except Exception:
+            self.model, self.state = None, "offline"
+            return
+        self.models = sorted(m["id"] for m in data)
+        self.status = {m["id"]: m["status"]["value"] for m in data}
+        busy = [m for m, s in self.status.items() if s not in ("loaded", "unloaded")]
+        loaded = [m for m, s in self.status.items() if s == "loaded"]
+        if busy:
+            self.model, self.state, self._prev = busy[0], "loading", None
+            return
+        if not loaded:
+            self.model, self.state, self.n_ctx = None, "idle", 0
+            return
+        if loaded[0] != self.model:
+            self._prev, self._task = None, None
+        self.model = loaded[0]
+        try:
+            # autoload=false: polling must never reload a model that was just unloaded
+            slot = get(f"/slots?model={self.model}&autoload=false")[0]
+        except (urllib.error.URLError, OSError, ValueError, IndexError, KeyError):
+            self.state = "idle"
+            return
+
+        self.n_ctx = slot.get("n_ctx", 0)
+        if not slot.get("is_processing"):
+            self.state, self._task, self._samples, self._prev = "idle", None, [], (None, 0)
+            return
+        if slot.get("id_task") != self._task:
+            self._task, self._samples = slot.get("id_task"), []
+        self.decoded = (slot.get("next_token") or [{}])[0].get("n_decoded", 0)
+        if self._prev is not None:                         # first poll only sets the baseline
+            same = self._prev[0] == self._task
+            self._col_tokens += max(0, self.decoded - self._prev[1]) if same else self.decoded
+        self._prev = (self._task, self.decoded)
+        prompt = slot.get("n_prompt_tokens", 0)
+        self.ctx = prompt + self.decoded
+        self.cache = slot.get("n_prompt_tokens_cache", 0) / prompt if prompt else 0
+        self.state = "prompt" if self.decoded == 0 else "gen"
+        self._samples = [s for s in self._samples if now - s[0] <= 3.0] + [(now, self.decoded)]
+        if len(self._samples) > 1 and self._samples[-1][0] > self._samples[0][0]:
+            (t0, d0), (t1, d1) = self._samples[0], self._samples[-1]
+            self.rate = (d1 - d0) / (t1 - t0)
+
+    def push_column(self):
+        now = time.time()
+        if self._col_tokens > 0:
+            self.history.append(("gen", self._col_tokens / max(now - self._col_start, 1e-6), self.model))
+        else:
+            self.history.append((self.state, 0.0, self.model))
+        self._col_tokens, self._col_start = 0, now
+
+
+class Stats:
+    """Per-model figures from completed answers, plus energy since start."""
+
+    def __init__(self):
+        self.started = time.time()
+        self.data = collections.defaultdict(self._empty)
+        self.energy_total = 0.0                       # Wh since start/reset (including idle)
+        self.ready_since = {}                         # model -> datetime of last load
+
+    @staticmethod
+    def _empty():
+        return {"n": 0, "g_tok": 0, "g_sec": 0.0, "p_tok": 0, "p_sec": 0.0, "last": 0.0,
+                "mtp": [], "ttft": [], "cached": 0, "prompt_total": 0,
+                "buckets": [[0, 0.0] for _ in CTX_BUCKETS], "wh": 0.0, "live_tok": 0}
+
+    def reset(self):
+        ready = self.ready_since
+        self.__init__()
+        self.ready_since = ready
+
+    def add(self, ev, live):
+        if ev["kind"] == "ready":
+            self.ready_since[ev["model"]] = ev["ts"]
+        if ev["kind"] != "answer":
+            return
+        d = self.data[ev["model"]]
+        d["n"] += 1
+        d["g_tok"] += ev["g_tok"]
+        d["g_sec"] += ev["g_sec"]
+        d["p_tok"] += ev["p_tok"]
+        d["p_sec"] += ev["p_tok"] / ev["p_tps"] if ev["p_tps"] else 0
+        d["last"] = ev["g_tps"]
+        d["ttft"].append(ev["ttft"])
+        d["cached"] += ev["cached"]
+        d["prompt_total"] += ev["prompt_total"]
+        if ev["mtp"] is not None:
+            d["mtp"].append(ev["mtp"])
+        bucket = next(i for i, (limit, _) in enumerate(CTX_BUCKETS) if ev["ctx"] < limit)
+        d["buckets"][bucket][0] += ev["g_tok"]
+        d["buckets"][bucket][1] += ev["g_sec"]
+        if live:
+            d["live_tok"] += ev["g_tok"]
+
+    def add_energy(self, watts, seconds, active_model):
+        wh = watts * seconds / 3600
+        self.energy_total += wh
+        if active_model:
+            self.data[active_model]["wh"] += wh
+
+
+# ================================================================ rendering
+
+def vlen(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def clip(s, width):
+    """Truncates to a visible width without cutting ANSI color codes apart."""
+    if vlen(s) <= width:
+        return s
+    out, n, i = [], 0, 0
+    while i < len(s) and n < width - 1:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        out.append(s[i])
+        n, i = n + 1, i + 1
+    return "".join(out) + "…" + RESET
+
+
+def bar(frac, width, color):
+    filled = round(min(1.0, max(0.0, frac)) * width)
+    return f"{color}{'█' * filled}{DIM}{'░' * (width - filled)}{RESET}"
+
+
+def level_color(frac):
+    return GREEN if frac < 0.6 else YELLOW if frac < 0.85 else RED
+
+
+def nice_max(v):
+    for step in (25, 50, 100, 250, 500):
+        if v <= step * 8:
+            return max(step, -(-v // step) * step)
+    return v
+
+
+def fmt_dur(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600} h {seconds % 3600 // 60:02d} min"
+
+
+def columns(history, plot_w, window):
+    """Aggregates the per-second history into plot_w columns (window=None: 1 s per column)."""
+    hist = list(history)
+    if window is None:
+        cols = hist[-plot_w:]
+        return [("none", 0.0, None)] * (plot_w - len(cols)) + cols, len(cols)
+    hist = hist[-window:]
+    per_col = window / plot_w
+    buckets = [[] for _ in range(plot_w)]
+    offset = window - len(hist)                         # missing past stays empty
+    for i, entry in enumerate(hist):
+        buckets[min(plot_w - 1, int((offset + i) / per_col))].append(entry)
+    result = []
+    for b in buckets:
+        gens = [e for e in b if e[0] == "gen"]
+        if gens:
+            model = collections.Counter(e[2] for e in gens).most_common(1)[0][0]
+            result.append(("gen", sum(e[1] for e in gens) / len(gens), model))
+        elif any(e[0] == "loading" for e in b):
+            result.append(("loading", 0.0, None))
+        elif any(e[0] == "prompt" for e in b):
+            result.append(("prompt", 0.0, None))
+        else:
+            result.append(("none", 0.0, None))
+    return result, window
+
+
+def render(mon, sysinfo, stats, log_lines, window, paused, view):
+    cols, rows = shutil.get_terminal_size((100, 40))
+    cols = max(cols, 40)
+    head, chart, tables, footer = [], [], [], []
+
+    # ---- title: model & state
+    c = mon.color(mon.model)
+    name = f"{c}{BOLD}{mon.model}{RESET}" if mon.model else "–"
+    since = stats.ready_since.get(mon.model) if mon.state != "loading" else None
+    since_s = ""
+    if since and mon.model:
+        since_s = f"  {DIM}(loaded for {fmt_dur((datetime.datetime.now(since.tzinfo) - since).total_seconds())}){RESET}"
+    if mon.state == "gen":
+        status = f"⏳ generating  {mon.decoded} tok @ {BOLD}{mon.rate:.1f} tok/s{RESET}"
+    elif mon.state == "prompt":
+        status = f"{BLUE}⏳ processing prompt …{RESET}"
+    elif mon.state == "loading":
+        status = f"{YELLOW}⏳ loading model …{RESET}"
+    elif mon.state == "offline":
+        status = f"{RED}server unreachable{RESET}"
+    else:
+        status = f"{DIM}ready{RESET}" if mon.model else f"{DIM}no model loaded{RESET}"
+    flags = f"  {YELLOW}{BOLD}[PAUSED]{RESET}" if paused else ""
+    head.append(f"{BOLD}llm-tps{RESET} · {name} · {status}{since_s}{flags}")
+
+    # ---- meters: label, bar, value right next to the bar; two columns from 100 columns on
+    items = []                                         # (label, fraction or None, color, text)
+    if mon.n_ctx and mon.model and mon.state != "loading":
+        frac = mon.ctx / mon.n_ctx
+        cache = f"cache {mon.cache * 100:3.0f}% · " if mon.state in ("gen", "prompt") else ""
+        items.append(("Context", frac, level_color(frac),
+                      f"{cache}{mon.ctx / 1000:.1f}k/{mon.n_ctx // 1000}k {frac * 100:3.0f}%"))
+    else:
+        items.append(("Context", None, None, "– no active model –"))
+    g = sysinfo.gpu
+    if g:
+        vram = g["used"] / g["total"]
+        power = g["power"] / g["limit"] if g["limit"] else 0
+        items.append(("Power", power, level_color(power),
+                      f"{g['power']:.0f}/{g['limit']:.0f} W · Σ {stats.energy_total:.1f} Wh"))
+        items.append(("GPU", g["util"] / 100, GREEN, f"{g['temp']:.0f} °C · {g['util']:3.0f}%"))
+        items.append(("VRAM", vram, level_color(vram), f"{g['used']:.1f}/{g['total']:.1f} GB"))
+    else:
+        items.append(("GPU", None, None, "nvidia-smi not available"))
+    ram = sysinfo.ram_used / sysinfo.ram_total if sysinfo.ram_total else 0
+    cpu = sysinfo.llama_cores / sysinfo.ncpu
+    items.append(("RAM", ram, level_color(ram),
+                  f"llama {sysinfo.llama_rss:.1f} · {sysinfo.ram_used:.1f}/{sysinfo.ram_total:.0f} GB"))
+    items.append(("CPU", cpu, level_color(cpu), f"{sysinfo.llama_cores:.1f}/{sysinfo.ncpu} threads {cpu * 100:3.0f}%"))
+
+    label_w, value_w = 9, 28
+    two_col = cols >= 100
+    cell_w = (cols - 3) // 2 if two_col else cols          # 3 = separator " │ "
+    bar_w = max(6, cell_w - label_w - value_w - 1)
+
+    def meter(item):
+        label, frac, color, text = item
+        if frac is None:
+            cell = f"{label:<{label_w}}{DIM}{text}{RESET}"
+        else:
+            cell = f"{label:<{label_w}}{bar(frac, bar_w, color)} {text}"           # value right after the bar
+        return cell + " " * max(0, cell_w - vlen(cell))
+
+    if two_col:
+        for i in range(0, len(items), 2):
+            head.append(meter(items[i]) + (f" {DIM}│{RESET} " + meter(items[i + 1]) if i + 1 < len(items) else ""))
+    else:
+        head.extend(meter(item) for item in items)
+
+    # ---- history chart
+    label_w = 6
+    plot_w = max(10, cols - label_w - 2)
+    visible, span = columns(mon.history, plot_w, window)
+    top = nice_max(max([v for s, v, _ in visible if s == "gen"] + [1.0]))
+
+    def chart_lines(height):
+        out = []
+        for r in range(height):
+            level = height - 1 - r
+            label = f"{top:>5.0f}" if r == 0 else f"{top / 2:>5.0f}" if r == height // 2 else ""
+            line = [f"{DIM}{label:>{label_w - 1}} ┤{RESET}"]
+            for state, value, model in visible:
+                if state == "gen":
+                    eighths = max(1, round(value / top * height * 8))
+                    line.append(mon.color(model) + BLOCKS[min(8, max(0, eighths - level * 8))] + RESET)
+                elif state in ("prompt", "loading") and level == 0:
+                    line.append((BLUE if state == "prompt" else YELLOW) + "▃" + RESET)
+                else:
+                    line.append(" ")
+            out.append("".join(line))
+        out.append(f"{DIM}{'tok/s':>{label_w - 1}} └{'─' * plot_w}{RESET}")
+        left = f"-{fmt_dur(span)}" + ("" if window else " (auto)")
+        out.append(f"{'':{label_w}}{DIM}{left}{'now':>{max(1, plot_w - len(left))}}{RESET}")
+        legend = "   ".join(f"{mon.color(m)}█{RESET} {m}" for m in mon.models)
+        out.append(f"{'':{label_w}}{legend}   {BLUE}▃{RESET} prompt   {YELLOW}▃{RESET} loading")
+        return out
+
+    # ---- per-model tables
+    model_list = mon.models or sorted(stats.data)
+    t1 = [f"{BOLD}{'Model':<19}{'Answ.':>6}{'Ø output':>12}{'last':>11}{'Ø prompt':>11}"
+          f"{'Ø TTFT':>8}{'Cache':>7}{'MTP':>6}{'Out today':>12}{'Wh/1k':>7}{RESET}"]
+    t2 = [f"{BOLD}{'Output speed by context':<25}" + "".join(f"{label:>10}" for _, label in CTX_BUCKETS) + RESET]
+    for m in model_list:
+        d = stats.data.get(m) or Stats._empty()
+        st = mon.status.get(m)
+        mark = "●" if st == "loaded" else "◌" if st not in (None, "unloaded") else " "
+        label = f"{mon.color(m)}{mark} {m:<17}{RESET}"
+        if d["n"]:
+            g_avg = d["g_tok"] / d["g_sec"] if d["g_sec"] else 0
+            p_avg = d["p_tok"] / d["p_sec"] if d["p_sec"] else 0
+            ttft = sorted(d["ttft"])[len(d["ttft"]) // 2]                       # median
+            cache = f"{d['cached'] / d['prompt_total'] * 100:5.0f}%" if d["prompt_total"] else "    –"
+            mtp = f"{sum(d['mtp']) / len(d['mtp']) * 100:4.0f}%" if d["mtp"] else "   –"
+            tok = f"{d['g_tok'] / 1000:.1f}k" if d["g_tok"] >= 1000 else str(d["g_tok"])
+            wh = f"{d['wh'] / d['live_tok'] * 1000:6.2f}" if d["live_tok"] >= 100 else "     –"
+            t1.append(f"{label}{d['n']:>6}{g_avg:>8.1f} t/s{d['last']:>7.1f} t/s{p_avg:>7.0f} t/s"
+                      f"{ttft:>6.1f} s{cache:>7}{mtp:>6}{tok:>12}{wh:>7}")
+            cells = []
+            for tok_b, sec_b in d["buckets"]:
+                cells.append(f"{tok_b / sec_b:>6.1f} t/s" if sec_b else f"{'–':>10}")
+            t2.append(f"{label}      " + "".join(cells))
+        else:
+            t1.append(f"{label}{0:>6}{'–':>12}{'–':>11}{'–':>11}{'–':>8}{'–':>7}{'–':>6}{'–':>12}{'–':>7}")
+            t2.append(f"{label}      " + "".join(f"{'–':>10}" for _ in CTX_BUCKETS))
+
+    hr = f"{DIM}{'─' * cols}{RESET}"
+    footer.append(hr)
+    footer.append(f"{DIM}q quit · p pause · v view: {BOLD}{view}{RESET}{DIM} · "
+                  f"1/2/3/4 window 1/5/15/60 min · a auto · c reset stats{RESET}")
+
+    # ---- distribute space. Order depends on the view; in "all" the log keeps at least a third.
+    chart_extra = 4                                   # axis, time line, legend, separator
+    free = rows - 1 - len(head) - 1 - len(footer) - 1  # minus separator, footer, log heading
+    t1_h, t2_h = len(t1) + 1, len(t2) + 1
+    chart_h, show_t1, show_t2 = 0, False, False
+    if view == "all":
+        budget = free - max(5, rows // 3)
+        if budget >= 3 + chart_extra:
+            chart_h, budget = 3, budget - 3 - chart_extra
+        if budget >= t1_h:
+            show_t1, budget = True, budget - t1_h
+        if budget >= t2_h:
+            show_t2, budget = True, budget - t2_h
+        if chart_h:
+            chart_h += max(0, min(5, budget))         # most of the rest goes to the log
+    elif view == "chart":
+        budget = free - 4
+        show_t1 = budget >= t1_h + 3 + chart_extra
+        budget -= t1_h if show_t1 else 0
+        show_t2 = budget >= t2_h + 3 + chart_extra
+        budget -= t2_h if show_t2 else 0
+        chart_h = max(0, min(20, budget - chart_extra))
+    # view "log": header and events only
+
+    if chart_h >= 2:
+        chart = chart_lines(chart_h) + [hr]
+    if show_t1:
+        tables += t1 + [hr]
+    if show_t2:
+        tables += t2 + [hr]
+
+    if two_col:                                        # separator that closes the column line with ┴
+        rule = f"{DIM}{'─' * (cell_w + 1)}┴{'─' * max(0, cols - cell_w - 2)}{RESET}"
+    else:
+        rule = hr
+    body = head + [rule] + chart + tables
+    ev_room = rows - 1 - len(body) - len(footer)
+    if ev_room > 0:
+        body.append(f"{BOLD}Events & answers{RESET}")
+        body.extend(list(log_lines)[-(ev_room - 1):] if ev_room > 1 else [])
+    lines = [clip(l, cols) for l in body]
+    lines += [""] * max(0, rows - 1 - len(lines) - len(footer)) + [clip(l, cols) for l in footer]
+    return "\033[H" + "".join(l + "\033[K\n" for l in lines[:rows - 1]) + "\033[J"
+
+
+# ================================================================ modes
+
+def run_dashboard():
+    mon, stats, sysinfo = Monitor(), Stats(), System()
+    mon.poll()
+    log_lines = collections.deque(maxlen=300)
+    incoming = collections.deque()
+    start = datetime.datetime.now().astimezone()
+
+    def follow():
+        for ev in events(journal(True).stdout):
+            ev["live"] = ev["ts"] >= start
+            incoming.append(ev)
+
+    threading.Thread(target=follow, daemon=True).start()
+
+    interactive = sys.stdin.isatty()
+    old_term = termios.tcgetattr(sys.stdin) if interactive else None
+    window, paused, last_frame, view = None, False, "", VIEWS[0]
+    sys.stdout.write("\033[?1049h\033[?25l")
+    try:
+        if interactive:
+            tty.setcbreak(sys.stdin.fileno())
+        next_col, last_tick = time.time() + 1.0, time.time()
+        while True:
+            mon.poll()
+            now = time.time()
+            if now >= next_col:
+                mon.push_column()
+                if sysinfo.gpu:
+                    active = mon.model if mon.state in ("gen", "prompt") else None
+                    stats.add_energy(sysinfo.gpu["power"], now - last_tick, active)
+                last_tick, next_col = now, next_col + 1.0
+                if next_col < now:                                  # don't catch up after a stall
+                    next_col = now + 1.0
+            while incoming:
+                ev = incoming.popleft()
+                stats.add(ev, live=ev["live"])
+                log_lines.append(describe(ev, mon.color))
+            if not paused:
+                frame = render(mon, sysinfo, stats, log_lines, window, paused, view)
+                if frame != last_frame:                             # only redraw on change
+                    sys.stdout.write(frame)
+                    sys.stdout.flush()
+                    last_frame = frame
+            key = None
+            if interactive and select.select([sys.stdin], [], [], 0.25)[0]:
+                key = sys.stdin.read(1).lower()
+                if key == "":                                     # stdin closed
+                    interactive = False
+            elif not interactive:
+                time.sleep(0.25)
+            if key == "q":
+                break
+            if key == "p":
+                paused = not paused
+                frame = render(mon, sysinfo, stats, log_lines, window, paused, view)
+                sys.stdout.write(frame)
+                sys.stdout.flush()
+                last_frame = frame
+            elif key == "v":
+                view = VIEWS[(VIEWS.index(view) + 1) % len(VIEWS)]
+            elif key in WINDOWS:
+                window = WINDOWS[key]
+            elif key == "c":
+                stats.reset()
+                log_lines.append(f"{time.strftime('%H:%M:%S')}  ⟲ statistics reset")
+    finally:
+        if old_term is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def run_plain():
+    lock = threading.Lock()
+    mon = Monitor()
+
+    def out(text):
+        with lock:
+            sys.stdout.write("\r\033[K" + text + "\n")
+            sys.stdout.flush()
+
+    start = datetime.datetime.now().astimezone()
+    threading.Thread(target=lambda: [out(describe(ev, mon.color)) for ev in events(journal(True).stdout)
+                                     if ev["ts"] >= start], daemon=True).start()
+    print("Waiting for requests … (Ctrl+C to quit)")
+    while True:
+        time.sleep(0.5)
+        mon.poll()
+        name = f"{mon.color(mon.model)}{mon.model}{RESET}"
+        with lock:
+            if mon.state == "gen":
+                sys.stdout.write(f"\r\033[K⏳ {name}: {mon.decoded:5d} tok @ {mon.rate:5.1f} tok/s"
+                                 f"   (context {mon.ctx / 1000:.1f}k / {mon.n_ctx // 1000}k, cache {mon.cache * 100:.0f} %)")
+            elif mon.state == "prompt":
+                sys.stdout.write(f"\r\033[K⏳ {name}: processing prompt …")
+            elif mon.state == "loading":
+                sys.stdout.write(f"\r\033[K⏳ loading {name} …")
+            else:
+                sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+
+def main():
+    global SERVER, UNIT
+    parser = argparse.ArgumentParser(
+        prog="llm-tps", description="Live terminal dashboard for a local llama.cpp router.",
+        epilog="Dashboard keys: q quit · p pause · v view · 1/2/3/4 window 1/5/15/60 min · a auto · c reset stats")
+    parser.add_argument("-n", type=int, metavar="N", help="print the last N answers and events, then exit")
+    parser.add_argument("--plain", action="store_true", help="plain text output instead of the dashboard")
+    parser.add_argument("--server", default=SERVER, help=f"router URL (default: {SERVER})")
+    parser.add_argument("--unit", default=UNIT, help=f"systemd user unit of the router (default: {UNIT})")
+    args = parser.parse_args()
+    SERVER, UNIT = args.server.rstrip("/"), args.unit
+    try:
+        if args.n is not None:
+            mon = Monitor()
+            mon.poll()
+            color = mon.color if sys.stdout.isatty() else (lambda m: "")
+            found = list(events(journal(False).stdout))
+            if not found:
+                print(f"No llama.cpp router events found today in the journal of user unit '{UNIT}'.\n"
+                      f"Check the unit name (--unit or LLM_TPS_UNIT): journalctl --user -u {UNIT}",
+                      file=sys.stderr)
+            for ev in found[-args.n:]:
+                print(describe(ev, color))
+        elif args.plain or not sys.stdout.isatty():
+            run_plain()
+        else:
+            run_dashboard()
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()

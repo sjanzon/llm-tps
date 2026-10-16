@@ -1,0 +1,11 @@
+# systemd user unit – copy to ~/.config/systemd/user/llama-router.service
+[Unit]
+Description=llama.cpp router (port 8080)
+
+[Service]
+ExecStart=%h/llm/start-llm.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
