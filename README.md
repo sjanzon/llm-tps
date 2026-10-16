@@ -79,7 +79,7 @@ q quit · p pause · v view: all · 1/2/3/4 window 1/5/15/60 min · a auto · c 
 ## Installation
 
 ```bash
-git clone https://github.com/<user>/llm-tps.git
+git clone https://github.com/sjanzon/llm-tps.git
 install -m 755 llm-tps/llm-tps ~/.local/bin/llm-tps
 ```
 

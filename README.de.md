@@ -81,7 +81,7 @@ Die Oberfläche des Programms ist englisch.
 ## Installation
 
 ```bash
-git clone https://github.com/<user>/llm-tps.git
+git clone https://github.com/sjanzon/llm-tps.git
 install -m 755 llm-tps/llm-tps ~/.local/bin/llm-tps
 ```
 
