@@ -118,8 +118,9 @@ def events(lines):
             yield ev
 
 
-def describe(ev, color=lambda m: ""):
-    c = color(ev.get("model", ""))
+def describe(ev, color=None):
+    """One log line for an event; without a color function it contains no ANSI codes at all."""
+    c = color(ev.get("model", "")) if color else ""
     name = f"{c}{ev.get('model', '')}{RESET if c else ''}"
     k = ev["kind"]
     if k == "answer":
@@ -135,7 +136,9 @@ def describe(ev, color=lambda m: ""):
     if k == "evict":
         return f"{ev['t']}  ⇄ model switch: unloading {name}"
     if k == "exit":
-        status = "" if ev["status"] == 0 else f" {RED}(exit code {ev['status']}){RESET}"
+        status = "" if ev["status"] == 0 else f" (exit code {ev['status']})"
+        if status and color:
+            status = f" {RED}{status[1:]}{RESET}"
         return f"{ev['t']}  ■ {name} unloaded{status}"
     if k == "service":
         return f"{ev['t']}  ⚙ {ev['text']}"
@@ -659,22 +662,26 @@ def run_dashboard():
 
 
 def run_plain():
+    """Plain text without colors; the live status line (\\r + clear line) only on a terminal."""
     lock = threading.Lock()
     mon = Monitor()
+    live = sys.stdout.isatty()
 
     def out(text):
         with lock:
-            sys.stdout.write("\r\033[K" + text + "\n")
+            sys.stdout.write(("\r\033[K" if live else "") + text + "\n")
             sys.stdout.flush()
 
     start = datetime.datetime.now().astimezone()
-    threading.Thread(target=lambda: [out(describe(ev, mon.color)) for ev in events(journal(True).stdout)
+    threading.Thread(target=lambda: [out(describe(ev)) for ev in events(journal(True).stdout)
                                      if ev["ts"] >= start], daemon=True).start()
-    print("Waiting for requests … (Ctrl+C to quit)")
+    print("Waiting for requests … (Ctrl+C to quit)", flush=True)
     while True:
         time.sleep(0.5)
+        if not live:
+            continue
         mon.poll()
-        name = f"{mon.color(mon.model)}{mon.model}{RESET}"
+        name = mon.model
         with lock:
             if mon.state == "gen":
                 sys.stdout.write(f"\r\033[K⏳ {name}: {mon.decoded:5d} tok @ {mon.rate:5.1f} tok/s"
@@ -703,7 +710,7 @@ def main():
         if args.n is not None:
             mon = Monitor()
             mon.poll()
-            color = mon.color if sys.stdout.isatty() else (lambda m: "")
+            color = mon.color if sys.stdout.isatty() else None
             found = list(events(journal(False).stdout))
             if not found:
                 print(f"No llama.cpp router events found today in the journal of user unit '{UNIT}'.\n"
